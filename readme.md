@@ -1,5 +1,5 @@
 # www.pinkprisma.com
-面经导向的**面向offer学习系统**与**IT求职数据网站**
+面经数据驱动的**面向offer学习系统**与**IT求职数据网站**
 
 ## ![img](https://uploadfiles.nowcoder.com/images/20250827/64296322_1756247211878/D2B5CA33BD970F64A6301FA75AE2EB22)
 
