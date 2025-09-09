@@ -1,0 +1,383 @@
+generator client {
+  provider      = "prisma-client-js"
+  // 提高兼容性
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+  output        = "./generated/client"
+}
+
+/**
+ * generator docs {
+ * provider = "node node_modules/prisma-docs-generator"
+ * output   = "../generated/docs"
+ * }
+ */
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+//用户
+model user {
+  id                     Int                      @id @default(autoincrement())
+  username               String                   @unique(map: "username") @db.VarChar(50)
+  password               String                   @db.VarChar(500)
+  create_at              DateTime?                @default(now()) @db.Timestamp(0)
+  update_at              DateTime?                @default(now()) @db.Timestamp(0)
+  email                  String                   @db.VarChar(100)
+  role                   String                   @default("user") // 新增角色字段，默认为普通用户
+  is_banned              Boolean                  @default(false) // 用户是否被封禁
+  plan                   String                   @default("free") @db.VarChar(500)
+  user_articles          user_article[]
+  user_interview_summary user_interview_summary[]
+  user_notifications     UserNotification[] // 用户通知的中间表
+  user_violations        UserViolation[] // 用户违规记录
+  ai_conversations       ai_conversation[] // AI对话记录
+}
+
+// 网站状态
+model WebsiteStatus {
+  id        Int      @id @default(autoincrement())
+  status    String // 'online', 'maintenance'
+  message   String?  @db.Text
+  update_at DateTime @default(now()) @updatedAt
+}
+
+// 通知
+model Notification {
+  id          Int      @id @default(autoincrement())
+  title       String
+  content     String   @db.Text
+  create_at   DateTime @default(now())
+  target_user Int? // null表示全体用户，否则为特定用户的id
+
+  user_notifications UserNotification[] // 用户通知的中间表
+
+  @@index([target_user])
+}
+
+// 用户通知中间表，记录用户是否已读
+model UserNotification {
+  id              Int          @id @default(autoincrement())
+  user_id         Int
+  notification_id Int
+  is_read         Boolean      @default(false)
+  user            user         @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  notification    Notification @relation(fields: [notification_id], references: [id], onDelete: Cascade)
+
+  @@unique([user_id, notification_id])
+  @@index([user_id])
+  @@index([notification_id])
+}
+
+model user_apikey {
+  id       Int     @id @default(autoincrement())
+  user_id  Int //逻辑外键（一个用户可以有多个apikey）
+  provider String  @db.VarChar(100) //LLM提供商（如deepseek）
+  apikey   String  @db.VarChar(500) //加密后的API密钥（原255长度可能不够）
+  iv       String  @db.VarChar(32) //初始化向量(Initialization Vector)，用于AES加密
+  alias    String? @db.VarChar(100) //密钥别名，方便用户识别
+
+  create_at DateTime? @default(now()) @db.Timestamp(0)
+  update_at DateTime? @default(now()) @db.Timestamp(0)
+
+  //添加索引优化查询性能
+  @@unique([user_id, provider, alias]) //确保同一用户同一提供商的别名唯一
+  @@index([provider]) //按提供商查询
+}
+
+model user_article {
+  id         Int @id @default(autoincrement())
+  user_id    Int
+  article_id Int
+
+  upload_to_anki Boolean @default(false)
+  anki_note_id   BigInt? @db.BigInt //anki中对应笔记id（是否已同步到anki）
+  /**
+   * 用户视角下面试题的划分
+   * 维度1：收藏的和未收藏的
+   * 维度2：掌握的和未掌握的
+   */
+  is_favorite    Boolean @default(false) // 是否收藏
+  is_master      Boolean @default(false) // 是否已掌握
+
+  // 用户笔记（用户对面试题的笔记）
+  note String? @db.LongText
+
+  user    user    @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  article article @relation(fields: [article_id], references: [id], onDelete: Cascade)
+  own     Boolean @default(false) //是否为用户自己的面经的面试题（自己的面经的面试题是自己的）
+
+  @@unique([user_id, article_id])
+  @@index([user_id])
+  @@index([article_id])
+  @@index([is_favorite])
+  @@index([is_master])
+  @@index([upload_to_anki])
+  @@index([anki_note_id])
+}
+
+model user_interview_summary {
+  id                   Int     @id @default(autoincrement())
+  user_id              Int
+  interview_summary_id Int
+  own                  Boolean @default(false) //是否为用户自己的面经（自己亲自参与的面试）
+
+  user              user              @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  interview_summary interview_summary @relation(fields: [interview_summary_id], references: [id], onDelete: Cascade)
+
+  @@unique([user_id, interview_summary_id])
+  @@index([user_id])
+  @@index([interview_summary_id])
+}
+
+// 面试题和面经的多对多关系中间表
+model article_interview_summary {
+  id                   Int       @id @default(autoincrement())
+  article_id           Int
+  interview_summary_id Int
+  create_at            DateTime? @default(now()) @db.Timestamp(0)
+
+  article           article           @relation(fields: [article_id], references: [id], onDelete: Cascade)
+  interview_summary interview_summary @relation(fields: [interview_summary_id], references: [id], onDelete: Cascade)
+
+  @@unique([article_id, interview_summary_id])
+  @@index([article_id])
+  @@index([interview_summary_id])
+}
+
+//面经中的面试题
+model article {
+  id        Int       @id @default(autoincrement())
+  link      String    @unique @db.VarChar(500) // 题目链接（去掉query和hash）
+  create_at DateTime? @default(now()) @db.Timestamp(0) //用于记录外部题库题目的创建日期
+  update_at DateTime? @default(now()) @db.Timestamp(0) //用于记录外部题库题目的更新日期
+
+  title           String  @db.LongText //问题
+  quiz_type       String  @db.VarChar(255) //题目考察方式（问答题、选择题）
+  content         String  @db.LongText //参考答案
+  origin_content  String? @db.LongText //原始题目
+  content_mindmap String? @db.LongText //用于生成思维导图的精炼后的内容
+  user_note       String? @db.LongText //用户笔记
+  gist            String  @db.LongText
+
+  content_type String  @db.VarChar(255) //题目内容类型（如javascript、css）
+  job_type     String? @db.VarChar(255) //职位类型（如前端、后端、全栈）
+  hard         String  @db.VarChar(255) //难度（如1、2、2.5、3）
+
+  time_create DateTime? @default(now()) @db.Timestamp(0) //题目创建时间
+  time_update DateTime? @default(now()) @db.Timestamp(0) //题目更新时间
+
+  vector_id String? @db.VarChar(255) //向量数据库中的题目向量的id（metadata中存储）
+
+  version    String  @default("v1.0.0") @db.VarChar(255) //题目版本号，采用语义化版本管理
+  change_log String? @db.LongText //题目更新日志
+
+  model_used String? @db.VarChar(255) //使用的模型
+
+  is_processed Boolean @default(true) //是否已处理
+
+  interview_count Int @default(1) //在多少篇面经中出现过
+
+  user_articles               user_article[]
+  article_interview_summaries article_interview_summary[] // 与面经的多对多关系
+  // 相关面试题主表
+  related_questions           related_interview_question[] @relation("ArticleToRelated")
+  // 相关面试题关联表
+  related_by_questions        related_interview_question[] @relation("RelatedToArticle")
+
+  @@index([job_type], map: "job_type")
+  @@index([content_type], map: "content_type")
+  @@index([quiz_type], map: "quiz_type")
+  @@index([hard], map: "hard")
+  @@index([vector_id], map: "vector_id")
+}
+
+//面经（对应多个面试题）
+model interview_summary {
+  id           Int     @id @default(autoincrement())
+  post_link    String? @unique @db.VarChar(500) //文章URL
+  content_hash String  @unique @db.VarChar(32) //内容的 md5 hash
+
+  interview_type String? @db.VarChar(100) //面试类型（实习、校招、社招）
+  turn           String? @db.VarChar(100) //面试轮次
+  company_name   String? @db.VarChar(255) //公司唯一标识
+  company_scale  String? @db.VarChar(100) //公司规模
+
+  job_type String  @db.VarChar(255) //岗位类型（如前端、后端(默认java)、全栈
+  job_name String? @db.VarChar(255) //岗位名称
+  job_link String? @db.VarChar(500) //岗位链接
+
+  content String @db.LongText //面经内容
+
+  create_at DateTime? @default(now()) @db.Timestamp(0)
+  update_at DateTime? @default(now()) @db.Timestamp(0)
+
+  creator_id Int @default(1) //上传该面经的用户（已有的全设置为1因为都是我上传的）
+
+  copyright_type String @default("转载") @db.VarChar(255)
+
+  user_interview_summary                 user_interview_summary[]
+  article_interview_summaries            article_interview_summary[] // 与面试题的多对多关系
+  algorithm_question_interview_summaries algorithm_question_interview_summary[] // 与算法题的多对多关系
+  // 相关面经主表
+  related_interview_summaries            related_interview_summary[]            @relation("InterviewSummaryToRelated")
+  // 相关面经关联表
+  related_by_interview_summaries         related_interview_summary[]            @relation("RelatedToInterviewSummary")
+
+  total_article_count   Int     @default(0) //总面试题数量
+  success_article_count Int     @default(0) //成功处理并储存的面试题数量
+  all_article_success   Boolean @default(false) //是否所有面试题都成功处理并储存
+
+  vector_id String? @db.VarChar(255) //向量数据库中的面经向量的id（metadata中存储）
+
+  post_date DateTime? //发布日期
+  post_year Int?      @default(2025) //发布年份
+
+  @@index([company_name], map: "company_name")
+  @@index([job_type], map: "job_type")
+  @@index([company_scale], map: "company_scale")
+  @@index([turn], map: "turn")
+  @@index([interview_type], map: "interview_type")
+  @@index([vector_id], map: "vector_id")
+}
+
+// 相关面试题表
+model related_interview_question {
+  id                 Int       @id @default(autoincrement())
+  article_id         Int
+  related_article_id Int
+  create_at          DateTime? @default(now()) @db.Timestamp(0)
+
+  // 主表
+  article         article @relation("ArticleToRelated", fields: [article_id], references: [id], onDelete: Cascade)
+  // 关联表
+  related_article article @relation("RelatedToArticle", fields: [related_article_id], references: [id], onDelete: Cascade)
+
+  @@unique([article_id, related_article_id])
+  @@index([article_id])
+  @@index([related_article_id])
+}
+
+//相关面经表
+model related_interview_summary {
+  id                           Int       @id @default(autoincrement())
+  interview_summary_id         Int
+  related_interview_summary_id Int
+  create_at                    DateTime? @default(now()) @db.Timestamp(0)
+
+  // 主表
+  interview_summary         interview_summary @relation("InterviewSummaryToRelated", fields: [interview_summary_id], references: [id], onDelete: Cascade)
+  // 关联表
+  related_interview_summary interview_summary @relation("RelatedToInterviewSummary", fields: [related_interview_summary_id], references: [id], onDelete: Cascade)
+
+  @@unique([interview_summary_id, related_interview_summary_id])
+  @@index([interview_summary_id])
+  @@index([related_interview_summary_id])
+}
+
+// 黑名单邮箱
+model BannedEmail {
+  id        Int      @id @default(autoincrement())
+  email     String   @unique
+  reason    String?  @db.Text
+  create_at DateTime @default(now())
+
+  @@index([email])
+}
+
+// 用户违规记录
+model UserViolation {
+  id          Int      @id @default(autoincrement())
+  user_id     Int
+  email       String
+  type        String // 违规类型，如 'junk_content', 'sensitive_content', 'other'
+  description String?  @db.Text
+  create_at   DateTime @default(now())
+
+  user user @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id])
+  @@index([email])
+}
+
+//处理失败的面试题
+model failed_interview_question {
+  id                   Int     @id @default(autoincrement())
+  vector_id            String? @db.VarChar(255)
+  content              String? @db.LongText //题目内容
+  origin_content       String? @db.LongText //原始题目
+  interview_summary_id Int //逻辑外键（一个面经可以有多个失败的面试题）
+
+  related_interview_questions Json? // 相关面试题的id
+
+  success   Boolean   @default(false) //是否成功处理并储存
+  create_at DateTime? @default(now()) @db.Timestamp(0)
+  update_at DateTime? @default(now()) @db.Timestamp(0)
+}
+
+//面经和算法题之间的多对多关系中间表
+model algorithm_question_interview_summary {
+  id                    Int       @id @default(autoincrement())
+  algorithm_question_id Int
+  interview_summary_id  Int
+  create_at             DateTime? @default(now()) @db.Timestamp(0)
+
+  algorithm_question algorithm_question @relation(fields: [algorithm_question_id], references: [id], onDelete: Cascade)
+  interview_summary  interview_summary  @relation(fields: [interview_summary_id], references: [id], onDelete: Cascade)
+
+  @@unique([algorithm_question_id, interview_summary_id])
+  @@index([algorithm_question_id])
+  @@index([interview_summary_id])
+}
+
+//算法题
+model algorithm_question {
+  id             Int       @id @default(autoincrement())
+  link           String?   @unique @db.VarChar(500) //题目链接（去掉query和hash；leetcode、牛客、洛谷）
+  name           String    @db.LongText //题目名称（处理前是面经中的原文，处理后是题目名称）
+  origin_content String?   @db.LongText //原始题目
+  create_at      DateTime? @default(now()) @db.Timestamp(0)
+  update_at      DateTime? @default(now()) @db.Timestamp(0)
+
+  content_type String? @db.VarChar(255) //题目类型（如动态规划）
+  job_type     String? @db.VarChar(255) //职位类型（如前端、后端、全栈）
+  hard         String? @db.VarChar(255) //难度（如easy、medium、hard）
+
+  vector_id String? @db.VarChar(255) //向量数据库中的题目向量的id（metadata中存储）
+
+  processed Boolean @default(false) //是否已处理
+
+  algorithm_question_interview_summaries algorithm_question_interview_summary[] // 与面经的多对多关系
+}
+
+//爬取到的面经
+model interview_summary_crawled {
+  id           Int     @id @default(autoincrement())
+  post_link    String? @unique @db.VarChar(500) //文章URL
+  content_hash String  @unique @db.VarChar(32) //内容的 md5 hash
+  content      String  @db.LongText //面经内容
+  job_type     String? @db.VarChar(255) //岗位类型（如前端、后端、全栈
+
+  post_date DateTime? //发布日期
+  post_year Int?      @default(2025) //发布年份
+  processed Boolean   @default(false) //是否已处理
+
+  create_at DateTime? @default(now()) @db.Timestamp(0)
+  update_at DateTime? @default(now()) @db.Timestamp(0)
+}
+
+// AI对话记录
+model ai_conversation {
+  id        Int       @id @default(autoincrement())
+  keyname   String    @unique @db.VarChar(100)
+  label     String    @db.VarChar(100)
+  content   Json? //前端使用的聊天历史
+  history   Json? //langchain使用的聊天历史
+  user_id   Int
+  create_at DateTime? @default(now()) @db.Timestamp(0)
+  update_at DateTime? @default(now()) @db.Timestamp(0)
+  user      user      @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id], map: "user_id")
+}

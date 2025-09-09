@@ -47,14 +47,14 @@ services:
     image: mysql
     #占用的主机端口:网络内访问使用的端口
     ports:
-      - '3308:3306'
+      - '3309:3306'
       # 目录内不能有文件,否则报错
     volumes:
       - ./docker-data/mysql:/var/lib/mysql
     environment:
       # 初始数据库
       MYSQL_DATABASE: prisma-ai
-      MYSQL_ROOT_PASSWORD: Qwqw1314!
+      MYSQL_ROOT_PASSWORD: prisma-ai
       # 允许任何主机连接
       MYSQL_ROOT_HOST: '%'
     restart: unless-stopped
