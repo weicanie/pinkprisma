@@ -1,0 +1,233 @@
+name: 手动部署到生产环境 (Manual CD)
+
+# 手动触发工作流
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_deployment:
+        description: '确认部署到生产环境 (输入 "DEPLOY" 确认)'
+        required: true
+        default: ''
+
+jobs:
+  deploy:
+    name: 部署到生产环境
+    runs-on: ubuntu-latest
+
+    # 只有输入正确确认字符串才执行部署
+    if: github.event.inputs.confirm_deployment == 'DEPLOY'
+
+    steps:
+      # 1. 检出代码
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # 2. 设置 Node.js 环境
+      - name: 设置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      # 3. 安装依赖
+      - name: 安装依赖
+        run: |
+          npm ci
+          cd packages/frontend
+          npm ci
+
+      # 4. 构建前端
+      - name: 构建前端静态文件
+        run: |
+          cd packages/frontend
+          npm run build
+
+      # 5. 服务探测 - 登录网站并设置维护状态
+      - name: 设置网站为维护状态
+        run: |
+          echo "正在登录网站并设置维护状态..."
+
+          # 登录获取token
+          LOGIN_RESPONSE=$(curl -s -X POST "https://pinkprisma.com/api/auth/login" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "email": "${{ secrets.WEBSITE_LOGIN_USERNAME }}",
+              "password": "${{ secrets.WEBSITE_LOGIN_PASSWORD }}"
+            }')
+
+          # 提取token
+          TOKEN=$(echo $LOGIN_RESPONSE | jq -r '.data.token')
+
+          if [ "$TOKEN" = "null" ] || [ -z "$TOKEN" ]; then
+            echo "登录失败，无法获取token"
+            exit 1
+          fi
+
+          echo "登录成功，正在设置维护状态..."
+
+          # 设置网站为维护状态
+          curl -s -X PUT "https://pinkprisma.com/api/manage/service/status" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $TOKEN" \
+            -d '{"status": "maintenance"}'
+            
+          echo "网站已设置为维护状态"
+
+      # 6. 轮询服务状态，等待任务完成
+      - name: 等待所有任务完成
+        run: |
+          echo "正在等待所有任务完成..."
+
+          # 重新登录获取token（防止token过期）
+          LOGIN_RESPONSE=$(curl -s -X POST "https://pinkprisma.com/api/auth/login" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "email": "${{ secrets.WEBSITE_LOGIN_EMAIL }}",
+              "password": "${{ secrets.WEBSITE_LOGIN_PASSWORD }}"
+            }')
+
+          TOKEN=$(echo $LOGIN_RESPONSE | jq -r '.data.token')
+
+          # 轮询直到所有任务完成
+          MAX_WAIT_TIME=300  # 最大等待5分钟
+          WAIT_TIME=0
+
+          while [ $WAIT_TIME -lt $MAX_WAIT_TIME ]; do
+            # 获取服务状态
+            STATUS_RESPONSE=$(curl -s -X GET "https://pinkprisma.com/api/manage/service/status" \
+              -H "Authorization: Bearer $TOKEN")
+            
+            PENDING_TASKS=$(echo $STATUS_RESPONSE | jq -r '.data.pendingTasks // 0')
+            RUNNING_TASKS=$(echo $STATUS_RESPONSE | jq -r '.data.runningTasks // 0')
+            
+            echo "当前状态: 阻塞任务=$PENDING_TASKS, 运行中任务=$RUNNING_TASKS"
+            
+            # 如果所有任务都完成了，退出循环
+            if [ "$PENDING_TASKS" = "0" ] && [ "$RUNNING_TASKS" = "0" ]; then
+              echo "所有任务已完成，可以开始部署"
+              break
+            fi
+            
+            echo "等待任务完成中... (已等待 ${WAIT_TIME}s)"
+            sleep 10
+            WAIT_TIME=$((WAIT_TIME + 10))
+          done
+
+          if [ $WAIT_TIME -ge $MAX_WAIT_TIME ]; then
+            echo "等待超时，但继续部署"
+          fi
+
+      # 7. SSH连接服务器并停止服务
+      - name: 停止服务器上的Docker服务
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: 47.102.108.122
+          username: root
+          key: ${{ secrets.SERVER_SSH_PRIVATE_KEY }}
+          script: |
+            echo "正在停止Docker服务..."
+            cd /opt/prisma-ai-hub-deploy
+
+            # 停止所有运行中的容器
+            if [ "$(docker ps -q)" ]; then
+              docker stop $(docker ps -q)
+              echo "已停止所有运行中的Docker容器"
+            else
+              echo "没有运行中的Docker容器"
+            fi
+
+            # 清理停止的容器
+            # docker container prune -f
+
+      # 8. 部署前端静态文件
+      - name: 部署前端静态文件到服务器
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: 47.102.108.122
+          username: root
+          key: ${{ secrets.SERVER_SSH_PRIVATE_KEY }}
+          source: 'packages/frontend/dist/*'
+          target: '/opt/prisma-ai-hub-deploy/'
+          strip_components: 0
+          overwrite: true
+
+      # 9. 启动服务
+      - name: 启动Docker服务
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: 47.102.108.122
+          username: root
+          key: ${{ secrets.SERVER_SSH_PRIVATE_KEY }}
+          script: |
+            echo "正在启动Docker服务..."
+            cd /opt/prisma-ai-hub-deploy
+
+            # 启动服务
+            docker compose -f ./compose.CD.yaml up --build -d
+
+            echo "Docker服务启动完成"
+
+            # 等待服务启动
+            echo "等待服务启动..."
+            sleep 30
+
+            # 检查服务状态
+            docker ps
+
+      # 10. 健康检查并恢复在线状态
+      - name: 健康检查并恢复服务状态
+        run: |
+          echo "正在进行健康检查..."
+
+          # 等待服务完全启动
+          sleep 60
+
+          # 检查网站是否可访问
+          MAX_RETRY=10
+          RETRY_COUNT=0
+
+          while [ $RETRY_COUNT -lt $MAX_RETRY ]; do
+            if curl -s -f "https://pinkprisma.com/api/health" > /dev/null; then
+              echo "网站健康检查通过"
+              break
+            fi
+            
+            echo "健康检查失败，重试中... ($((RETRY_COUNT + 1))/$MAX_RETRY)"
+            sleep 10
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+          done
+
+          if [ $RETRY_COUNT -ge $MAX_RETRY ]; then
+            echo "健康检查失败，但继续恢复服务状态"
+          fi
+
+          # 登录并恢复在线状态
+          echo "正在恢复网站在线状态..."
+
+          LOGIN_RESPONSE=$(curl -s -X POST "https://pinkprisma.com/api/auth/login" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "email": "${{ secrets.WEBSITE_LOGIN_EMAIL }}",
+              "password": "${{ secrets.WEBSITE_LOGIN_PASSWORD }}"
+            }')
+
+          TOKEN=$(echo $LOGIN_RESPONSE | jq -r '.data.token')
+
+          if [ "$TOKEN" != "null" ] && [ -n "$TOKEN" ]; then
+            # 恢复在线状态
+            curl -s -X PUT "https://pinkprisma.com/api/manage/service/status" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer $TOKEN" \
+              -d '{"status": "online"}'
+              
+            echo "网站已恢复在线状态"
+          else
+            echo "无法登录，请手动恢复网站在线状态"
+          fi
+
+      # 11. 部署完成通知
+      - name: 部署完成
+        run: |
+          echo "🎉 部署完成！"
+          echo "网站地址: https://pinkprisma.com"
+          echo "请验证网站功能是否正常"
